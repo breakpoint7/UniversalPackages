@@ -35,7 +35,7 @@ If the content *is* a typed library (NuGet, npm, Maven, PyPI, Cargo), prefer the
 Before you start, make sure you have:
 
 1. An **Azure DevOps organization** and **project** (e.g., `https://dev.azure.com/<org>/<project>`).
-2. An **Azure Artifacts feed** created in that project. (Project Settings → Artifacts → **+ Create Feed**.)
+2. An **Azure Artifacts feed** created in that project — see §3 below.
 3. The **Azure CLI** installed: <https://learn.microsoft.com/cli/azure/install-azure-cli>.
 4. The **azure-devops** CLI extension:
    ```powershell
@@ -54,9 +54,76 @@ Before you start, make sure you have:
 
 ---
 
-## 3. Create a Universal Package from a Directory
+## 3. Create an Azure Artifacts Feed
 
-### 3.1 Lay out your source directory
+A **feed** is the container that holds your packages and controls who can read/publish them. You need one before you can publish anything.
+
+### 3.1 Create via the web UI (easiest)
+
+1. Browse to `https://dev.azure.com/<org>/<project>`.
+2. Open **Artifacts** in the left nav.
+3. Click **+ Create Feed**.
+4. Fill in:
+   - **Name** — e.g., `BuildTools`. Lowercase, no spaces recommended.
+   - **Visibility** — who can *see* the feed:
+     - *People in my organization* (typical for internal feeds).
+     - *Specific people* (locked-down, you grant access explicitly).
+   - **Scope** — **Project** vs **Organization**:
+     - **Project-scoped** (recommended default): lives under one project, simpler permissions, supports project-level PATs. Use when the feed serves one team/project. CLI calls must pass `--project <proj> --scope project`.
+     - **Organization-scoped**: shared across all projects in the org. Use only when multiple projects genuinely need the same feed. CLI calls omit `--project` and pass `--scope organization`.
+   - **Include packages from common public sources** (the upstream sources checkbox) — see §3.3.
+5. Click **Create**.
+
+### 3.2 Create via the CLI
+
+```powershell
+az artifacts feed create `
+  --organization "https://dev.azure.com/<org>" `
+  --project "<project>" `
+  --name "BuildTools"
+```
+
+Omit `--project` to create an **organization-scoped** feed. By default this creates a project-scoped feed with the standard `@Local`, `@Prerelease`, `@Release` views.
+
+### 3.3 Upstream sources — should you enable them?
+
+**Upstream sources** let your feed transparently proxy packages from public registries (nuget.org, npmjs.com, PyPI, Maven Central, etc.). When a client asks the feed for a package it doesn't have, the feed fetches it from the upstream, **caches it in your feed**, and serves it back. Subsequent requests are served from the cache.
+
+**Enable upstreams (recommended for most teams) when:**
+
+- Your projects consume any public NuGet / npm / PyPI / Maven / Cargo packages — the cache gives you **build reproducibility** even if a public package is yanked/deleted (e.g., the classic `left-pad` scenario).
+- You want a **single feed URL** for developers and CI — they point at your feed and get both your private packages and public ones.
+- You want a **supply-chain checkpoint**: every public package that enters your org gets recorded in the feed, with audit history and the ability to deprecate/remove specific versions.
+- You operate behind a restricted network and need a controlled egress point for public packages.
+
+**Leave upstreams off when:**
+
+- The feed will hold **only Universal Packages** or other purely internal artifacts (there is no public Universal Packages registry to proxy, so upstreams add nothing useful for a Universal-only feed).
+- Org policy requires that public packages flow through a **separate, dedicated** ingestion feed that you then promote into release feeds — in which case enable upstreams on the ingestion feed only.
+- You explicitly want to forbid public packages from being pulled into the feed.
+
+**Practical recommendation:** if your feed will mix Universal Packages with any language-typed packages (NuGet/npm/etc.), **enable upstream sources** and accept the default public sources. You can always add or remove individual upstreams later under Feed Settings → **Upstream sources**. If the feed is *purely* Universal Packages, leave upstreams off — you can enable them later if the feed's purpose expands.
+
+> Once a public package version has been pulled through an upstream and cached, **that exact version stays in your feed even if it's removed upstream** — this is the main reproducibility benefit.
+
+### 3.4 Set feed permissions
+
+After creating, open **Feed Settings → Permissions** and verify the roles:
+
+| Role            | Who should have it                                          |
+| --------------- | ----------------------------------------------------------- |
+| **Owner**       | Feed admins (small group).                                  |
+| **Contributor** | People/services that publish packages, including pipelines. |
+| **Collaborator**| Can save packages from upstreams but not publish their own. |
+| **Reader**      | Everyone who consumes packages.                             |
+
+For pipelines, add **Project Collection Build Service (<org>)** as **Contributor** (publish) or **Reader** (download-only).
+
+---
+
+## 4. Create a Universal Package from a Directory
+
+### 4.1 Lay out your source directory
 
 Put everything you want to ship into a single folder. The folder's contents (recursively) become the package payload — the top-level folder name itself is **not** included.
 
@@ -72,12 +139,12 @@ C:\src\my-tools\
 └── README.txt
 ```
 
-### 3.2 Choose a name and version
+### 4.2 Choose a name and version
 
 - **Name**: lowercase, `a–z 0–9 - _ .`, max 255 chars (e.g., `build-tools-win-x64`).
 - **Version**: must be **SemVer 2.0** — `MAJOR.MINOR.PATCH` with optional `-prerelease` (e.g., `1.0.0`, `1.2.3-beta.1`).
 
-### 3.3 Publish
+### 4.3 Publish
 
 ```powershell
 az artifacts universal publish `
@@ -95,13 +162,13 @@ Notes:
 
 - Use `--scope organization` (and omit `--project`) if your feed is **organization-scoped**.
 - Upload is **chunked and deduplicated** — re-publishing similar content is fast.
-- A version **cannot be overwritten**. To replace, publish a new version (see §6).
+- A version **cannot be overwritten**. To replace, publish a new version (see §7).
 
 ---
 
-## 4. Download / Consume a Universal Package
+## 5. Download / Consume a Universal Package
 
-### 4.1 Manually on any machine (build agent, dev box)
+### 5.1 Manually on any machine (build agent, dev box)
 
 ```powershell
 az artifacts universal download `
@@ -119,7 +186,7 @@ Tips:
 - Use `--version "*"` to get the **latest** version, or a SemVer range like `"1.x"` / `"^1.2.0"`.
 - The target `--path` is created if it doesn't exist; files land directly inside it (no wrapper folder).
 
-### 4.2 In an Azure Pipeline (YAML)
+### 5.2 In an Azure Pipeline (YAML)
 
 Use the built-in **UniversalPackages** task — no Azure CLI install needed.
 
@@ -160,13 +227,13 @@ steps:
 
 `versionOption` of `major`/`minor`/`patch` will look at the latest version in the feed and bump it automatically — ideal for CI.
 
-### 4.3 In a Classic pipeline
+### 5.3 In a Classic pipeline
 
 Use the **Universal packages** task from the task catalog with the same inputs as above.
 
 ---
 
-## 5. Authenticating Build Agents (Self-Hosted)
+## 6. Authenticating Build Agents (Self-Hosted)
 
 - **Microsoft-hosted agents**: auth is automatic via the pipeline's `System.AccessToken` — nothing to configure.
 - **Self-hosted agents**: the agent's service account must have **Reader** (download) or **Contributor** (publish) on the feed. Grant via Feed Settings → **Permissions**.
@@ -174,11 +241,11 @@ Use the **Universal packages** task from the task catalog with the same inputs a
 
 ---
 
-## 6. Updating and Versioning Packages
+## 7. Updating and Versioning Packages
 
 Universal Package versions are **immutable** — you cannot republish the same `name@version` with different content. To ship a change, publish a **new version**.
 
-### 6.1 Pick a SemVer bump
+### 7.1 Pick a SemVer bump
 
 | Change in package contents                              | Bump   | Example          |
 | ------------------------------------------------------- | ------ | ---------------- |
@@ -187,20 +254,20 @@ Universal Package versions are **immutable** — you cannot republish the same `
 | Removed/renamed files, breaking changes for consumers   | MAJOR  | 1.1.0 → 2.0.0    |
 | Pre-release / testing                                   | suffix | 2.0.0-beta.1     |
 
-### 6.2 Recommended update workflow
+### 7.2 Recommended update workflow
 
 1. Update the files in your source directory.
 2. Decide the new version (manually, or let the pipeline auto-bump with `versionOption: patch`).
-3. Re-run the publish command/task from §3 or §4.2.
+3. Re-run the publish command/task from §4 or §5.2.
 4. Update consuming pipelines to reference the new version, or pin to a range (`1.x`, `*`) if you want automatic uptake.
 
-### 6.3 Pinning strategy for consumers
+### 7.3 Pinning strategy for consumers
 
 - **Pin exact** (`1.2.3`) for reproducible builds — recommended for release pipelines.
 - **Pin range** (`1.x`, `^1.2.0`) for dev/CI pipelines that should pick up patches automatically.
 - **Use `*`** only when you genuinely always want latest (rare; risks unexpected breakage).
 
-### 6.4 Promoting through views (optional but recommended)
+### 7.4 Promoting through views (optional but recommended)
 
 Each Azure Artifacts feed has **views** (commonly `@Local`, `@Prerelease`, `@Release`). Promote a version to a view to signal quality:
 
@@ -217,14 +284,14 @@ az artifacts universal promote `
 
 Consumers can then restrict themselves to `@Release` quality versions via the feed view URL.
 
-### 6.5 Deprecating / removing versions
+### 7.5 Deprecating / removing versions
 
 - **Deprecate**: mark a version as deprecated in the Azure DevOps UI (Artifacts → package → version → ⋯) to discourage use without breaking existing consumers.
 - **Unlist / Delete**: also available via the UI or `az artifacts universal` — but prefer deprecating over deleting because deletion breaks pinned consumers.
 
 ---
 
-## 7. End-to-End Example
+## 8. End-to-End Example
 
 Scenario: ship a folder of Windows signing tools as `signing-tools-win` and consume them in a release pipeline.
 
@@ -280,7 +347,7 @@ Because the consumer pinned `1.x`, the next pipeline run automatically picks up 
 
 ---
 
-## 8. Troubleshooting Cheatsheet
+## 9. Troubleshooting Cheatsheet
 
 | Symptom                                              | Likely cause / fix                                                                                  |
 | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
@@ -293,7 +360,7 @@ Because the consumer pinned `1.x`, the next pipeline run automatically picks up 
 
 ---
 
-## 9. Quick Reference
+## 10. Quick Reference
 
 **Publish:**
 ```powershell
